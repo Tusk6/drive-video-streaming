@@ -15,8 +15,8 @@ from requests.adapters import HTTPAdapter
 
 BASE_DIR = Path(__file__).resolve().parent
 SERVICE_ACCOUNT_FILE = BASE_DIR / "service-account.json"
-CACHE_DIR = BASE_DIR / "cache"
-DB_FILE = BASE_DIR / "progress.db"
+CACHE_DIR = /var/data/cache
+DB_FILE = /var/data/progress.db
 
 CHUNK_SIZE = 8 * 1024 * 1024
 MAX_CACHE_TOTAL = 5 * 1024 * 1024 * 1024
