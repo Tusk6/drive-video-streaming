@@ -30,15 +30,8 @@ LOCAL_SERVICE_ACCOUNT_FILE = Path(__file__).resolve().parent / "service-account.
 DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "1-l0SF3-SpaN3GopA5R2Aezqc17y539C9")
 # Cache each video in 8 MiB pieces to keep seeking reasonably responsive.
 CHUNK_SIZE = 8 * 1024 * 1024
-# Keep the persistent video cache capped at 2 GiB by default.
-# Railway can override this with MAX_CACHE_TOTAL_BYTES when a different volume size is used.
-MAX_CACHE_TOTAL = int(os.getenv("MAX_CACHE_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024)))
-# Keep this much disk space free so temporary files and SQLite can still operate safely.
-CACHE_MIN_FREE_BYTES = int(os.getenv("CACHE_MIN_FREE_BYTES", str(64 * 1024 * 1024)))
-# Start pressure cleanup when the cache reaches this fraction of its configured limit.
-CACHE_HIGH_WATERMARK = float(os.getenv("CACHE_HIGH_WATERMARK", "0.85"))
-# After pressure cleanup, aim to reduce the cache to this fraction of its configured limit.
-CACHE_TARGET_WATERMARK = float(os.getenv("CACHE_TARGET_WATERMARK", "0.65"))
+# Keep the persistent video cache capped at 2 GiB to avoid filling the Railway volume.
+MAX_CACHE_TOTAL = 2 * 1024 * 1024 * 1024
 # Prefetch the next two pieces while the current piece is being watched.
 PREFETCH_CHUNKS = 2
 # Limit background prefetch concurrency so Google Drive is not unnecessarily hammered.
@@ -385,116 +378,40 @@ def chunk_path(file_id, index):
     return cache_dir(file_id) / ("chunk_%08d.bin" % index)
 
 
-def cache_usage():
-    # Collect the current cache size and every completed cache chunk.
+def evict_cache():
+    # Collect all cached chunks and their access times.
     files = []
+    # Track total cache bytes.
     total = 0
-    # Walk only completed chunk files; temporary downloads are handled separately.
+    # Walk every video cache directory.
     for path in CACHE_DIR.rglob("chunk_*.bin"):
         try:
-            # Read file metadata once for size and LRU ordering.
+            # Read file metadata once.
             stat = path.stat()
+            # Add this chunk to the total size.
             total += stat.st_size
+            # Save access time, path and size for eviction sorting.
             files.append((stat.st_atime, path, stat.st_size))
         except OSError:
-            # Ignore files that disappear during a concurrent cleanup.
+            # Ignore chunks that disappear during the scan.
             pass
-    # Return the cache inventory and its total size.
-    return total, files
-
-
-def evict_cache(target_total=None, required_free=0):
-    # Read the current cache inventory.
-    total, files = cache_usage()
-    # Read the actual filesystem capacity and currently available space.
-    try:
-        disk = shutil.disk_usage(DATA_DIR)
-    except OSError:
-        # If disk usage cannot be read, keep the old size-limit behavior.
-        disk = None
-
-    # Calculate the desired cache target from the configured limit.
-    if target_total is None:
-        target_total = int(MAX_CACHE_TOTAL * CACHE_TARGET_WATERMARK)
-    # Never allow the target to exceed the configured hard cache limit.
-    target_total = min(target_total, MAX_CACHE_TOTAL)
-
-    # Under disk pressure, also account for the minimum free-space reserve and the next write.
-    if disk is not None:
-        pressure_target = max(0, disk.total - CACHE_MIN_FREE_BYTES - required_free)
-        target_total = min(target_total, pressure_target)
-
-    # Stop when both the cache size and available disk space are safe.
-    if total <= target_total and (disk is None or disk.free >= CACHE_MIN_FREE_BYTES + required_free):
-        return total
-
-    # Remove the least-recently-used chunks first.
+    # Stop immediately when the cache is below the configured limit.
+    if total <= MAX_CACHE_TOTAL:
+        return
+    # Remove least-recently-used chunks first.
     files.sort(key=lambda item: item[0])
-    # Delete chunks until the requested target is reached.
+    # Delete old chunks until the cache is back below its limit.
     for _, path, size in files:
-        if total <= target_total:
+        if total <= MAX_CACHE_TOTAL:
             break
         try:
             # Remove the selected cached chunk.
             path.unlink()
-            # Keep the running cache size accurate.
+            # Keep the running total accurate.
             total -= size
         except OSError:
-            # Ignore chunks already removed by another request.
+            # Ignore chunks already removed by another operation.
             pass
-
-    # Re-check physical free space after cache eviction.
-    if disk is not None:
-        try:
-            disk = shutil.disk_usage(DATA_DIR)
-        except OSError:
-            disk = None
-
-    # Return the resulting cache size; callers can separately check free space.
-    return total
-
-
-class CacheSpaceError(OSError):
-    # Signal that a cache write cannot be completed safely, allowing streaming to bypass the cache.
-    pass
-
-
-def ensure_cache_space(required_bytes):
-    # Read the current filesystem state before starting a potentially large cache write.
-    try:
-        disk = shutil.disk_usage(DATA_DIR)
-    except OSError as exc:
-        raise OSError("Unable to read Railway volume free space") from exc
-
-    # Calculate the free-space reserve required after the new chunk is written.
-    needed_free = CACHE_MIN_FREE_BYTES + required_bytes
-    # Trigger cleanup when the cache approaches its configured high-water mark.
-    total, _ = cache_usage()
-    high_water = int(MAX_CACHE_TOTAL * CACHE_HIGH_WATERMARK)
-    if total >= high_water or disk.free < needed_free:
-        # Evict toward the lower target while preserving enough space for the new chunk.
-        evict_cache(required_free=required_bytes)
-
-    # Check the physical free space again after cleanup.
-    try:
-        disk = shutil.disk_usage(DATA_DIR)
-    except OSError as exc:
-        raise OSError("Unable to read Railway volume free space after cleanup") from exc
-
-    # If space is still insufficient, make one more aggressive cleanup pass.
-    if disk.free < needed_free:
-        evict_cache(target_total=0, required_free=required_bytes)
-        disk = shutil.disk_usage(DATA_DIR)
-
-    # Refuse the write before opening the temporary file if the volume is still full.
-    if disk.free < needed_free:
-        raise CacheSpaceError(
-            "Railway volume does not have enough free space for this cache chunk: "
-            + str(disk.free)
-            + " bytes free, "
-            + str(needed_free)
-            + " bytes required"
-        )
 
 
 def clear_cache():
@@ -562,18 +479,6 @@ def download_chunk(file_id, index, file_size):
             response.close()
             raise HTTPException(status_code=502, detail="Unexpected Google Drive byte range")
 
-        # Make enough room before creating the temporary file, not after the disk is already full.
-        try:
-            ensure_cache_space(expected)
-        except CacheSpaceError:
-            # Close the Drive response and let iter_range fall back to direct streaming.
-            response.close()
-            raise
-        except OSError:
-            # Close the Drive response before propagating unexpected filesystem errors.
-            response.close()
-            raise
-
         # Write to a temporary file so an interrupted download cannot corrupt a valid chunk.
         temp = path.with_suffix(".tmp")
         written = 0
@@ -582,28 +487,14 @@ def download_chunk(file_id, index, file_size):
             with open(temp, "wb") as output:
                 for block in response.iter_content(chunk_size=1024 * 1024):
                     if block:
-                        try:
-                            # Write the current block to the temporary cache file.
-                            output.write(block)
-                        except OSError as exc:
-                            # Convert a full volume into a controlled HTTP error instead of crashing the stream.
-                            if getattr(exc, "errno", None) == 28:
-                                # Try to free space while preserving the current incomplete temp file.
-                                try:
-                                    output.flush()
-                                except OSError:
-                                    pass
-                                raise CacheSpaceError(
-                                    "Railway cache volume became full while downloading a video chunk"
-                                ) from exc
-                            raise
+                        output.write(block)
                         written += len(block)
             # Reject incomplete data before publishing the cache chunk.
             if written != expected:
                 raise HTTPException(status_code=502, detail="Incomplete chunk from Google Drive")
             # Atomically publish the complete chunk.
             os.replace(temp, path)
-            # Perform a light LRU cleanup after a successful download.
+            # Enforce the global cache size limit after the successful download.
             evict_cache()
             # Return the completed cache path.
             return path
@@ -616,31 +507,6 @@ def download_chunk(file_id, index, file_size):
             except OSError:
                 # Ignore cleanup races.
                 pass
-
-
-def stream_drive_range(file_id, start, end):
-    # Build the Google Drive media endpoint for a direct, non-cached byte-range request.
-    url = "https://www.googleapis.com/drive/v3/files/" + file_id
-    # Ask Google Drive for exactly the bytes that the browser still needs.
-    response = get_session().get(
-        url,
-        params={"alt": "media"},
-        headers=drive_headers({"Range": "bytes=%d-%d" % (start, end)}),
-        stream=True,
-        timeout=(10, 120),
-    )
-    # Require a successful partial-content response from Google Drive.
-    if response.status_code != 206:
-        response.close()
-        raise HTTPException(status_code=502, detail="Google Drive direct range request failed")
-    # Stream the requested bytes without writing anything to the Railway volume.
-    try:
-        for block in response.iter_content(chunk_size=1024 * 1024):
-            if block:
-                yield block
-    finally:
-        # Always release the Google connection after direct streaming finishes.
-        response.close()
 
 
 def prefetch(file_id, first_index, file_size):
@@ -668,26 +534,17 @@ def iter_range(file_id, start, end, file_size):
     last = end // CHUNK_SIZE
     # Stream each required cache chunk in order.
     for index in range(first, last + 1):
-        # Calculate this chunk's absolute byte boundaries.
-        chunk_start = index * CHUNK_SIZE
-        chunk_end = min(chunk_start + CHUNK_SIZE - 1, file_size - 1)
-        # Calculate the exact portion of this chunk requested by the browser.
-        requested_start = max(start, chunk_start)
-        requested_end = min(end, chunk_end)
-        try:
-            # Download the chunk to persistent cache when enough disk space is available.
-            path = download_chunk(file_id, index, file_size)
-        except CacheSpaceError:
-            # If the volume is under pressure, bypass the cache instead of failing playback.
-            yield from stream_drive_range(file_id, requested_start, end)
-            return
+        # Download the chunk on demand or reuse the existing cache file.
+        path = download_chunk(file_id, index, file_size)
         # Stop safely if no chunk exists beyond the file size.
         if path is None:
             return
-        # Calculate the beginning of the requested range inside the cached chunk.
-        offset = requested_start - chunk_start
-        # Calculate where the requested range ends inside this cached chunk.
-        limit = requested_end - chunk_start
+        # Calculate the beginning of this cache chunk in the original video.
+        chunk_start = index * CHUNK_SIZE
+        # Calculate where the requested range starts inside this chunk.
+        offset = max(start, chunk_start) - chunk_start
+        # Calculate where the requested range ends inside this chunk.
+        limit = min(end, chunk_start + CHUNK_SIZE - 1) - chunk_start
         # Open the cached chunk for streaming.
         with open(path, "rb") as source:
             # Seek directly to the requested byte inside the chunk.
@@ -711,6 +568,64 @@ def iter_range(file_id, start, end, file_size):
                     pass
                 # Yield the block to FastAPI's streaming response.
                 yield block
+
+
+def parse_range(header, file_size):
+    # Without a Range header, serve the complete file.
+    if not header:
+        return 0, file_size - 1
+    # Accept the standard single-range syntax used by HTML5 video players.
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip())
+    # Reject malformed or multi-range requests.
+    if not match:
+        raise HTTPException(status_code=416, detail="Invalid Range header")
+    # Extract the optional start and end values.
+    start_text, end_text = match.groups()
+    # Reject a range that specifies neither boundary.
+    if not start_text and not end_text:
+        raise HTTPException(status_code=416, detail="Invalid Range header")
+    # Handle suffix ranges such as bytes=-500000.
+    if not start_text:
+        length = int(end_text)
+        if length <= 0:
+            raise HTTPException(status_code=416, detail="Invalid Range header")
+        start = max(file_size - length, 0)
+        end = file_size - 1
+    else:
+        # Handle ranges such as bytes=100000- or bytes=100000-200000.
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
+        if start >= file_size or start > end:
+            raise HTTPException(status_code=416, detail="Range not satisfiable")
+        end = min(end, file_size - 1)
+    # Return the normalized byte range.
+    return start, end
+
+
+def init_db():
+    # Open the persistent SQLite progress database.
+    connection = sqlite3.connect(DB_FILE, timeout=30)
+    try:
+        # Create the progress table if this is the first startup.
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS progress ("
+            "viewer_id TEXT NOT NULL, "
+            "video_key TEXT NOT NULL, "
+            "position REAL NOT NULL DEFAULT 0, "
+            "duration REAL NOT NULL DEFAULT 0, "
+            "updated_at INTEGER NOT NULL, "
+            "PRIMARY KEY (viewer_id, video_key)"
+            ")"
+        )
+        # Persist the schema creation.
+        connection.commit()
+    finally:
+        # Close the SQLite connection.
+        connection.close()
+
+
+# Initialize SQLite before accepting HTTP requests.
+init_db()
 
 
 @app.get("/health")
@@ -1183,6 +1098,9 @@ a:hover { text-decoration: underline; }
 .search:focus { border-color: #666; }
 .refresh { padding: 12px 15px; border: 1px solid #333; border-radius: 9px; background: #1a1c21; color: #fff; cursor: pointer; white-space: nowrap; }
 .refresh:disabled { opacity: .6; cursor: wait; }
+.danger { padding: 12px 15px; border: 1px solid #5a2b2b; border-radius: 9px; background: #241719; color: #ffb8b8; cursor: pointer; white-space: nowrap; }
+.danger:hover { background: #321d20; }
+.danger:disabled { opacity: .6; cursor: wait; }
 .section-note { color: #888; font-size: 13px; margin: -4px 0 12px; }
 .movie-item, .episode-item { padding: 9px 12px; border-bottom: 1px solid #22252b; }
 .movie-item:last-child, .episode-item:last-child { border-bottom: 0; }
@@ -1210,6 +1128,7 @@ a:hover { text-decoration: underline; }
 <div class="toolbar">
     <input id="search" class="search" type="search" placeholder="🔎 Tìm phim hoặc tập..." autocomplete="off">
     <button id="refresh" class="refresh" type="button">↻ Làm mới thư viện</button>
+    <button id="clear-cache" class="danger" type="button">🗑 Clear Cache</button>
 </div>
 
 <h2>Phim lẻ</h2>
@@ -1233,6 +1152,8 @@ a:hover { text-decoration: underline; }
 const search = document.getElementById("search");
 // Get the refresh button so its state can be changed during a refresh.
 const refreshButton = document.getElementById("refresh");
+// Get the cache-clear button so the administrator can remove cached video chunks.
+const clearCacheButton = document.getElementById("clear-cache");
 // Get all standalone movie rows.
 const movieItems = Array.from(document.querySelectorAll(".movie-item"));
 // Get all series rows.
@@ -1269,6 +1190,41 @@ const savedFolderState = loadFolderState();
 seriesDetails.forEach(function(details) {
     details.open = savedFolderState[details.dataset.seriesKey] === true;
     details.addEventListener("toggle", saveFolderState);
+});
+
+// Clear the persistent video cache after confirming the administrator token.
+clearCacheButton.addEventListener("click", async function() {
+    // Ask for the token instead of embedding the secret in the page source.
+    const token = window.prompt("Nhập CACHE_ADMIN_TOKEN để xóa toàn bộ cache:");
+    // Stop when the administrator cancels the prompt or leaves it empty.
+    if (!token) return;
+    // Ask for explicit confirmation because this removes every cached video chunk.
+    if (!window.confirm("Xóa toàn bộ cache video? Vị trí xem vẫn được giữ lại.")) return;
+    // Prevent repeated clicks while the server is clearing the cache.
+    clearCacheButton.disabled = true;
+    clearCacheButton.textContent = "⏳ Đang xóa...";
+    try {
+        // Send the secret only in the protected HTTP header.
+        const response = await fetch("/admin/clear-cache", {
+            method: "POST",
+            headers: { "X-Cache-Admin-Token": token }
+        });
+        // Decode the server response even when it reports an error.
+        const data = await response.json().catch(function() { return {}; });
+        // Show a clear message for authentication or server errors.
+        if (!response.ok) {
+            throw new Error(data.detail || ("HTTP " + response.status));
+        }
+        // Tell the administrator that only the video cache was deleted.
+        window.alert("Đã xóa toàn bộ cache video. progress.db vẫn được giữ nguyên.");
+    } catch (error) {
+        // Report the error without exposing the token.
+        window.alert("Không thể xóa cache: " + error.message);
+    } finally {
+        // Restore the button after the request finishes.
+        clearCacheButton.disabled = false;
+        clearCacheButton.textContent = "🗑 Clear Cache";
+    }
 });
 
 // Normalize text so searching is case-insensitive and works naturally with Vietnamese text.
