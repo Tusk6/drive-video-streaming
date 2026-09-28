@@ -34,7 +34,7 @@ CHUNK_SIZE = 8 * 1024 * 1024
 # Railway can override this with MAX_CACHE_TOTAL_BYTES when a different volume size is used.
 MAX_CACHE_TOTAL = int(os.getenv("MAX_CACHE_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024)))
 # Keep this much disk space free so temporary files and SQLite can still operate safely.
-CACHE_MIN_FREE_BYTES = int(os.getenv("CACHE_MIN_FREE_BYTES", str(512 * 1024 * 1024)))
+CACHE_MIN_FREE_BYTES = int(os.getenv("CACHE_MIN_FREE_BYTES", str(64 * 1024 * 1024)))
 # Start pressure cleanup when the cache reaches this fraction of its configured limit.
 CACHE_HIGH_WATERMARK = float(os.getenv("CACHE_HIGH_WATERMARK", "0.85"))
 # After pressure cleanup, aim to reduce the cache to this fraction of its configured limit.
@@ -454,6 +454,11 @@ def evict_cache(target_total=None, required_free=0):
     return total
 
 
+class CacheSpaceError(OSError):
+    # Signal that a cache write cannot be completed safely, allowing streaming to bypass the cache.
+    pass
+
+
 def ensure_cache_space(required_bytes):
     # Read the current filesystem state before starting a potentially large cache write.
     try:
@@ -483,8 +488,8 @@ def ensure_cache_space(required_bytes):
 
     # Refuse the write before opening the temporary file if the volume is still full.
     if disk.free < needed_free:
-        raise OSError(
-            "Railway volume is full even after cache cleanup: "
+        raise CacheSpaceError(
+            "Railway volume does not have enough free space for this cache chunk: "
             + str(disk.free)
             + " bytes free, "
             + str(needed_free)
@@ -560,9 +565,14 @@ def download_chunk(file_id, index, file_size):
         # Make enough room before creating the temporary file, not after the disk is already full.
         try:
             ensure_cache_space(expected)
-        except OSError as exc:
+        except CacheSpaceError:
+            # Close the Drive response and let iter_range fall back to direct streaming.
             response.close()
-            raise HTTPException(status_code=507, detail=str(exc)) from exc
+            raise
+        except OSError:
+            # Close the Drive response before propagating unexpected filesystem errors.
+            response.close()
+            raise
 
         # Write to a temporary file so an interrupted download cannot corrupt a valid chunk.
         temp = path.with_suffix(".tmp")
@@ -583,9 +593,8 @@ def download_chunk(file_id, index, file_size):
                                     output.flush()
                                 except OSError:
                                     pass
-                                raise HTTPException(
-                                    status_code=507,
-                                    detail="Railway cache volume became full while downloading a video chunk",
+                                raise CacheSpaceError(
+                                    "Railway cache volume became full while downloading a video chunk"
                                 ) from exc
                             raise
                         written += len(block)
@@ -607,6 +616,31 @@ def download_chunk(file_id, index, file_size):
             except OSError:
                 # Ignore cleanup races.
                 pass
+
+
+def stream_drive_range(file_id, start, end):
+    # Build the Google Drive media endpoint for a direct, non-cached byte-range request.
+    url = "https://www.googleapis.com/drive/v3/files/" + file_id
+    # Ask Google Drive for exactly the bytes that the browser still needs.
+    response = get_session().get(
+        url,
+        params={"alt": "media"},
+        headers=drive_headers({"Range": "bytes=%d-%d" % (start, end)}),
+        stream=True,
+        timeout=(10, 120),
+    )
+    # Require a successful partial-content response from Google Drive.
+    if response.status_code != 206:
+        response.close()
+        raise HTTPException(status_code=502, detail="Google Drive direct range request failed")
+    # Stream the requested bytes without writing anything to the Railway volume.
+    try:
+        for block in response.iter_content(chunk_size=1024 * 1024):
+            if block:
+                yield block
+    finally:
+        # Always release the Google connection after direct streaming finishes.
+        response.close()
 
 
 def prefetch(file_id, first_index, file_size):
@@ -634,17 +668,26 @@ def iter_range(file_id, start, end, file_size):
     last = end // CHUNK_SIZE
     # Stream each required cache chunk in order.
     for index in range(first, last + 1):
-        # Download the chunk on demand or reuse the existing cache file.
-        path = download_chunk(file_id, index, file_size)
+        # Calculate this chunk's absolute byte boundaries.
+        chunk_start = index * CHUNK_SIZE
+        chunk_end = min(chunk_start + CHUNK_SIZE - 1, file_size - 1)
+        # Calculate the exact portion of this chunk requested by the browser.
+        requested_start = max(start, chunk_start)
+        requested_end = min(end, chunk_end)
+        try:
+            # Download the chunk to persistent cache when enough disk space is available.
+            path = download_chunk(file_id, index, file_size)
+        except CacheSpaceError:
+            # If the volume is under pressure, bypass the cache instead of failing playback.
+            yield from stream_drive_range(file_id, requested_start, end)
+            return
         # Stop safely if no chunk exists beyond the file size.
         if path is None:
             return
-        # Calculate the beginning of this cache chunk in the original video.
-        chunk_start = index * CHUNK_SIZE
-        # Calculate where the requested range starts inside this chunk.
-        offset = max(start, chunk_start) - chunk_start
-        # Calculate where the requested range ends inside this chunk.
-        limit = min(end, chunk_start + CHUNK_SIZE - 1) - chunk_start
+        # Calculate the beginning of the requested range inside the cached chunk.
+        offset = requested_start - chunk_start
+        # Calculate where the requested range ends inside this cached chunk.
+        limit = requested_end - chunk_start
         # Open the cached chunk for streaming.
         with open(path, "rb") as source:
             # Seek directly to the requested byte inside the chunk.
@@ -668,64 +711,6 @@ def iter_range(file_id, start, end, file_size):
                     pass
                 # Yield the block to FastAPI's streaming response.
                 yield block
-
-
-def parse_range(header, file_size):
-    # Without a Range header, serve the complete file.
-    if not header:
-        return 0, file_size - 1
-    # Accept the standard single-range syntax used by HTML5 video players.
-    match = re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip())
-    # Reject malformed or multi-range requests.
-    if not match:
-        raise HTTPException(status_code=416, detail="Invalid Range header")
-    # Extract the optional start and end values.
-    start_text, end_text = match.groups()
-    # Reject a range that specifies neither boundary.
-    if not start_text and not end_text:
-        raise HTTPException(status_code=416, detail="Invalid Range header")
-    # Handle suffix ranges such as bytes=-500000.
-    if not start_text:
-        length = int(end_text)
-        if length <= 0:
-            raise HTTPException(status_code=416, detail="Invalid Range header")
-        start = max(file_size - length, 0)
-        end = file_size - 1
-    else:
-        # Handle ranges such as bytes=100000- or bytes=100000-200000.
-        start = int(start_text)
-        end = int(end_text) if end_text else file_size - 1
-        if start >= file_size or start > end:
-            raise HTTPException(status_code=416, detail="Range not satisfiable")
-        end = min(end, file_size - 1)
-    # Return the normalized byte range.
-    return start, end
-
-
-def init_db():
-    # Open the persistent SQLite progress database.
-    connection = sqlite3.connect(DB_FILE, timeout=30)
-    try:
-        # Create the progress table if this is the first startup.
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS progress ("
-            "viewer_id TEXT NOT NULL, "
-            "video_key TEXT NOT NULL, "
-            "position REAL NOT NULL DEFAULT 0, "
-            "duration REAL NOT NULL DEFAULT 0, "
-            "updated_at INTEGER NOT NULL, "
-            "PRIMARY KEY (viewer_id, video_key)"
-            ")"
-        )
-        # Persist the schema creation.
-        connection.commit()
-    finally:
-        # Close the SQLite connection.
-        connection.close()
-
-
-# Initialize SQLite before accepting HTTP requests.
-init_db()
 
 
 @app.get("/health")
