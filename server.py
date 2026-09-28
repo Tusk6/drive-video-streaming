@@ -5,6 +5,7 @@ import hashlib
 import html
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,8 @@ from requests.adapters import HTTPAdapter
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
 # Store downloaded video chunks inside the persistent data directory.
 CACHE_DIR = DATA_DIR / "cache"
+# Store extracted WebVTT subtitle files separately from video chunks.
+SUBTITLE_CACHE_DIR = DATA_DIR / "subtitles"
 # Store playback positions in SQLite on the persistent volume.
 DB_FILE = DATA_DIR / "progress.db"
 # Keep local testing compatible with the service-account.json file beside server.py.
@@ -47,6 +50,7 @@ CACHE_ADMIN_TOKEN = os.getenv("CACHE_ADMIN_TOKEN", "").strip()
 
 # Create persistent directories before the application starts.
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+SUBTITLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # Read the Google service-account JSON from Railway when deployed.
@@ -85,6 +89,8 @@ credentials_lock = threading.Lock()
 thread_local = threading.local()
 # Keep Google Drive file metadata in memory for a short period.
 metadata_cache = {}
+# Cache subtitle stream metadata in memory so repeated player loads do not run ffprobe unnecessarily.
+subtitle_metadata_cache = {}
 # Protect the metadata cache from concurrent access.
 metadata_lock = threading.Lock()
 # Prevent duplicate downloads of the same file chunk.
@@ -415,7 +421,7 @@ def evict_cache():
 
 
 def clear_cache():
-    # Ensure the cache root exists before deleting its contents.
+    # Ensure the video cache root exists before deleting its contents.
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     # Iterate over every cached video directory or file.
     for child in CACHE_DIR.iterdir():
@@ -429,6 +435,20 @@ def clear_cache():
         except OSError:
             # Ignore a file that disappears during cleanup.
             pass
+    # Also clear generated WebVTT files so subtitle extraction can be tested from a clean state.
+    SUBTITLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for child in SUBTITLE_CACHE_DIR.iterdir():
+        try:
+            # Remove cached subtitle files or unexpected subtitle subdirectories.
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError:
+            # Ignore a subtitle cache entry that disappears during cleanup.
+            pass
+    # Forget in-memory subtitle metadata after the cache is cleared.
+    subtitle_metadata_cache.clear()
 
 
 def download_chunk(file_id, index, file_size):
@@ -819,6 +839,197 @@ def head_video(video_key: str):
     )
 
 
+def get_drive_media_url(file_id):
+    # Build the authenticated Google Drive media endpoint for the requested file.
+    return "https://www.googleapis.com/drive/v3/files/" + file_id + "?alt=media"
+
+
+def get_subtitle_streams(file_id):
+    # Return cached subtitle metadata when it is already available for this Drive file.
+    with metadata_lock:
+        cached = subtitle_metadata_cache.get(file_id)
+        if cached is not None:
+            return cached
+
+    # Verify that ffprobe is installed before trying to inspect the MP4 container.
+    if shutil.which("ffprobe") is None:
+        raise HTTPException(status_code=503, detail="ffprobe is not installed on the server")
+
+    # Ask ffprobe to inspect only subtitle streams and return machine-readable JSON.
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "s",
+        "-show_entries",
+        "stream=index,codec_name:stream_tags=language,title",
+        "-of",
+        "json",
+        "-headers",
+        "Authorization: Bearer " + get_access_token() + "\r\n",
+        get_drive_media_url(file_id),
+    ]
+    try:
+        # Run ffprobe without writing the source video to the Railway volume.
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Avoid hanging a web request forever if ffprobe cannot inspect the remote MP4.
+        raise HTTPException(status_code=504, detail="Subtitle inspection timed out") from exc
+    except OSError as exc:
+        # Report a clear server-side error for an unavailable ffprobe executable.
+        raise HTTPException(status_code=503, detail="Cannot start ffprobe") from exc
+
+    # Convert ffprobe failures into a useful HTTP error instead of returning empty subtitles.
+    if result.returncode != 0:
+        detail = result.stderr.strip()[-500:] or "ffprobe could not inspect the video"
+        raise HTTPException(status_code=502, detail=detail)
+
+    try:
+        # Parse the JSON produced by ffprobe.
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        # Refuse malformed ffprobe output rather than generating a broken track list.
+        raise HTTPException(status_code=502, detail="Invalid ffprobe output") from exc
+
+    streams = []
+    # Convert ffprobe stream metadata into the small public structure used by the browser.
+    for subtitle_number, stream in enumerate(data.get("streams", [])):
+        tags = stream.get("tags") or {}
+        language = str(tags.get("language") or "").strip()
+        title = str(tags.get("title") or "").strip()
+        label = title or language or ("Phụ đề " + str(subtitle_number + 1))
+        streams.append({
+            "number": subtitle_number,
+            "stream_index": int(stream.get("index", subtitle_number)),
+            "language": language or "und",
+            "label": label,
+            "codec": str(stream.get("codec_name") or ""),
+        })
+
+    # Cache the metadata in memory for subsequent requests.
+    with metadata_lock:
+        subtitle_metadata_cache[file_id] = streams
+    # Return the discovered subtitle tracks.
+    return streams
+
+
+@app.get("/api/subtitles/{video_key}")
+def api_subtitles(video_key: str):
+    # Resolve the public video key to its private Google Drive file ID.
+    key, video = get_video(video_key)
+    # Inspect the MP4 container for embedded subtitle streams.
+    streams = get_subtitle_streams(video["id"])
+    # Return only browser-safe metadata and never expose the Drive file ID.
+    return {
+        "video_key": key,
+        "tracks": [
+            {
+                "index": item["number"],
+                "language": item["language"],
+                "label": item["label"],
+                "url": "/subtitle/" + key + "/" + str(item["number"]) + ".vtt",
+            }
+            for item in streams
+        ],
+    }
+
+
+@app.get("/subtitle/{video_key}/{track_index}.vtt")
+def subtitle_file(video_key: str, track_index: int):
+    # Resolve the public key to the corresponding Drive file.
+    key, video = get_video(video_key)
+    # Reject negative subtitle indexes.
+    if track_index < 0:
+        raise HTTPException(status_code=400, detail="Invalid subtitle track")
+    # Discover the available subtitle streams.
+    streams = get_subtitle_streams(video["id"])
+    # Reject a track number that does not exist.
+    if track_index >= len(streams):
+        raise HTTPException(status_code=404, detail="Subtitle track not found")
+
+    # Store each generated subtitle beside the persistent Railway data directory.
+    output_path = SUBTITLE_CACHE_DIR / (key + "_" + str(track_index) + ".vtt")
+    if output_path.exists() and output_path.stat().st_size > 0:
+        # Reuse a previously extracted WebVTT file without contacting Drive again.
+        return Response(
+            content=output_path.read_bytes(),
+            media_type="text/vtt; charset=utf-8",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    # Verify that ffmpeg is installed before extracting the embedded text track.
+    if shutil.which("ffmpeg") is None:
+        raise HTTPException(status_code=503, detail="ffmpeg is not installed on the server")
+
+    # Use the actual ffmpeg subtitle stream index discovered by ffprobe.
+    stream_index = streams[track_index]["stream_index"]
+    # Convert the embedded MOV/MP4 text subtitle to WebVTT without re-encoding the video.
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-headers",
+        "Authorization: Bearer " + get_access_token() + "\r\n",
+        "-i",
+        get_drive_media_url(video["id"]),
+        "-map",
+        "0:" + str(stream_index),
+        "-c:s",
+        "webvtt",
+        "-f",
+        "webvtt",
+        "pipe:1",
+    ]
+    try:
+        # Extract only the subtitle stream; the video is not transcoded or stored locally.
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Prevent a stuck subtitle extraction from occupying a worker indefinitely.
+        raise HTTPException(status_code=504, detail="Subtitle extraction timed out") from exc
+    except OSError as exc:
+        # Report an executable/runtime problem cleanly.
+        raise HTTPException(status_code=503, detail="Cannot start ffmpeg") from exc
+
+    # Return the ffmpeg error when conversion fails.
+    if result.returncode != 0 or not result.stdout:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()[-500:]
+        raise HTTPException(status_code=502, detail=detail or "Subtitle extraction failed")
+
+    # Write the small WebVTT result atomically so concurrent viewers never read a partial file.
+    temp_path = output_path.with_suffix(".tmp")
+    try:
+        # Write the complete subtitle output to a temporary file first.
+        temp_path.write_bytes(result.stdout)
+        # Atomically replace any previous subtitle cache entry.
+        temp_path.replace(output_path)
+    except OSError:
+        # If the Railway volume cannot write the small subtitle file, still return it to the browser.
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Return the generated WebVTT track to the browser.
+    return Response(
+        content=result.stdout,
+        media_type="text/vtt; charset=utf-8",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 # Escape arbitrary Drive names before inserting them into HTML.
 def safe_text(value):
     # Convert the value to a string and HTML-escape it.
@@ -879,41 +1090,58 @@ if (!viewerId) {
 player.src = "/video/" + VIDEO_KEY;
 let lastSaved = 0;
 
-// Try to expose subtitle tracks that the browser makes available from the MP4 container.
-function setupEmbeddedSubtitles() {
-    // Read the browser's currently exposed TextTrack list.
-    const tracks = player.textTracks;
-    // Remove old dynamically generated subtitle options before rebuilding the selector.
+// Ask the server to inspect the MP4 for embedded subtitle streams.
+async function setupEmbeddedSubtitles() {
+    // Always keep the selector visible so the viewer can see whether subtitles were found.
+    subtitlePanel.hidden = false;
+    subtitleStatus.textContent = "Đang kiểm tra...";
+    // Remove tracks previously added to the video element.
+    while (player.querySelector("track")) {
+        player.querySelector("track").remove();
+    }
+    // Reset the selector to the disabled state.
     while (subtitleSelect.options.length > 1) {
         subtitleSelect.remove(1);
     }
-    // Hide the subtitle panel when the browser exposes no embedded text tracks.
-    if (!tracks || tracks.length === 0) {
-        subtitlePanel.hidden = true;
-        subtitleStatus.textContent = "";
-        return;
-    }
-    // Show the subtitle selector when at least one track is exposed.
-    subtitlePanel.hidden = false;
-    subtitleStatus.textContent = "Đã nhận diện track nhúng";
-    // Add one option for every subtitle track exposed by the browser.
-    for (let index = 0; index < tracks.length; index += 1) {
-        const track = tracks[index];
-        // Only expose subtitle/caption tracks rather than metadata tracks.
-        if (track.kind !== "subtitles" && track.kind !== "captions") continue;
-        // Create a human-readable option using the track label or language.
-        const option = document.createElement("option");
-        option.value = String(index);
-        option.textContent = track.label || track.language || ("Phụ đề " + (index + 1));
-        subtitleSelect.appendChild(option);
-    }
-    // Start with subtitles disabled until the viewer explicitly selects one.
-    for (let index = 0; index < tracks.length; index += 1) {
-        tracks[index].mode = "disabled";
+    subtitleSelect.value = "-1";
+    try {
+        // Ask the FastAPI server for embedded subtitle metadata.
+        const response = await fetch("/api/subtitles/" + VIDEO_KEY);
+        if (!response.ok) throw new Error("subtitle metadata request failed");
+        const data = await response.json();
+        const tracks = Array.isArray(data.tracks) ? data.tracks : [];
+        // Tell the viewer when the MP4 contains no embedded subtitle stream.
+        if (tracks.length === 0) {
+            subtitleStatus.textContent = "Không có phụ đề nhúng";
+            return;
+        }
+        // Add one HTML5 WebVTT track for each embedded subtitle stream.
+        tracks.forEach(function(trackInfo, index) {
+            const trackElement = document.createElement("track");
+            trackElement.kind = "subtitles";
+            trackElement.label = trackInfo.label || ("Phụ đề " + (index + 1));
+            trackElement.srclang = trackInfo.language || "und";
+            trackElement.src = trackInfo.url;
+            trackElement.default = false;
+            player.appendChild(trackElement);
+            // Add the same track to the viewer's subtitle selector.
+            const option = document.createElement("option");
+            option.value = String(index);
+            option.textContent = trackInfo.label || ("Phụ đề " + (index + 1));
+            subtitleSelect.appendChild(option);
+        });
+        // Keep all subtitles disabled until the viewer selects one.
+        for (let index = 0; index < player.textTracks.length; index += 1) {
+            player.textTracks[index].mode = "disabled";
+        }
+        subtitleStatus.textContent = tracks.length + " track nhúng";
+    } catch (error) {
+        // Keep the player usable even if FFmpeg/FFprobe is temporarily unavailable.
+        subtitleStatus.textContent = "Không đọc được phụ đề";
     }
 }
 
-// Let the viewer turn an exposed embedded subtitle track on or off.
+// Let the viewer turn an extracted WebVTT subtitle track on or off.
 subtitleSelect.addEventListener("change", function() {
     // Read the selected track index, where -1 means subtitles are disabled.
     const selected = Number(subtitleSelect.value);
@@ -923,10 +1151,8 @@ subtitleSelect.addEventListener("change", function() {
     }
 });
 
-// Re-check subtitle tracks after the MP4 metadata has been loaded.
-player.addEventListener("loadedmetadata", setupEmbeddedSubtitles);
-// Some browsers expose text tracks slightly after metadata, so check again shortly afterward.
-player.addEventListener("canplay", setupEmbeddedSubtitles);
+// Inspect subtitles after the page has loaded enough for the video element to exist.
+setupEmbeddedSubtitles();
 async function loadProgress() {
     try {
         const response = await fetch(
