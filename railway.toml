@@ -1,6 +1,10 @@
 [build]
+# Keep the current Railway builder and let Railpack install the Python runtime/dependencies.
+builder = "RAILPACK"
 
 [deploy]
+# Start the FastAPI application with one worker because the video cache uses in-memory locks.
 startCommand = "uvicorn server:app --host 0.0.0.0 --port $PORT --workers 1"
+# Restart the service automatically after an unexpected failure.
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
