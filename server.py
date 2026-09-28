@@ -30,8 +30,15 @@ LOCAL_SERVICE_ACCOUNT_FILE = Path(__file__).resolve().parent / "service-account.
 DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "1-l0SF3-SpaN3GopA5R2Aezqc17y539C9")
 # Cache each video in 8 MiB pieces to keep seeking reasonably responsive.
 CHUNK_SIZE = 8 * 1024 * 1024
-# Keep the persistent video cache capped at 2 GiB to avoid filling the Railway volume.
-MAX_CACHE_TOTAL = 2 * 1024 * 1024 * 1024
+# Keep the persistent video cache capped at 2 GiB by default.
+# Railway can override this with MAX_CACHE_TOTAL_BYTES when a different volume size is used.
+MAX_CACHE_TOTAL = int(os.getenv("MAX_CACHE_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024)))
+# Keep this much disk space free so temporary files and SQLite can still operate safely.
+CACHE_MIN_FREE_BYTES = int(os.getenv("CACHE_MIN_FREE_BYTES", str(512 * 1024 * 1024)))
+# Start pressure cleanup when the cache reaches this fraction of its configured limit.
+CACHE_HIGH_WATERMARK = float(os.getenv("CACHE_HIGH_WATERMARK", "0.85"))
+# After pressure cleanup, aim to reduce the cache to this fraction of its configured limit.
+CACHE_TARGET_WATERMARK = float(os.getenv("CACHE_TARGET_WATERMARK", "0.65"))
 # Prefetch the next two pieces while the current piece is being watched.
 PREFETCH_CHUNKS = 2
 # Limit background prefetch concurrency so Google Drive is not unnecessarily hammered.
@@ -378,40 +385,111 @@ def chunk_path(file_id, index):
     return cache_dir(file_id) / ("chunk_%08d.bin" % index)
 
 
-def evict_cache():
-    # Collect all cached chunks and their access times.
+def cache_usage():
+    # Collect the current cache size and every completed cache chunk.
     files = []
-    # Track total cache bytes.
     total = 0
-    # Walk every video cache directory.
+    # Walk only completed chunk files; temporary downloads are handled separately.
     for path in CACHE_DIR.rglob("chunk_*.bin"):
         try:
-            # Read file metadata once.
+            # Read file metadata once for size and LRU ordering.
             stat = path.stat()
-            # Add this chunk to the total size.
             total += stat.st_size
-            # Save access time, path and size for eviction sorting.
             files.append((stat.st_atime, path, stat.st_size))
         except OSError:
-            # Ignore chunks that disappear during the scan.
+            # Ignore files that disappear during a concurrent cleanup.
             pass
-    # Stop immediately when the cache is below the configured limit.
-    if total <= MAX_CACHE_TOTAL:
-        return
-    # Remove least-recently-used chunks first.
+    # Return the cache inventory and its total size.
+    return total, files
+
+
+def evict_cache(target_total=None, required_free=0):
+    # Read the current cache inventory.
+    total, files = cache_usage()
+    # Read the actual filesystem capacity and currently available space.
+    try:
+        disk = shutil.disk_usage(DATA_DIR)
+    except OSError:
+        # If disk usage cannot be read, keep the old size-limit behavior.
+        disk = None
+
+    # Calculate the desired cache target from the configured limit.
+    if target_total is None:
+        target_total = int(MAX_CACHE_TOTAL * CACHE_TARGET_WATERMARK)
+    # Never allow the target to exceed the configured hard cache limit.
+    target_total = min(target_total, MAX_CACHE_TOTAL)
+
+    # Under disk pressure, also account for the minimum free-space reserve and the next write.
+    if disk is not None:
+        pressure_target = max(0, disk.total - CACHE_MIN_FREE_BYTES - required_free)
+        target_total = min(target_total, pressure_target)
+
+    # Stop when both the cache size and available disk space are safe.
+    if total <= target_total and (disk is None or disk.free >= CACHE_MIN_FREE_BYTES + required_free):
+        return total
+
+    # Remove the least-recently-used chunks first.
     files.sort(key=lambda item: item[0])
-    # Delete old chunks until the cache is back below its limit.
+    # Delete chunks until the requested target is reached.
     for _, path, size in files:
-        if total <= MAX_CACHE_TOTAL:
+        if total <= target_total:
             break
         try:
             # Remove the selected cached chunk.
             path.unlink()
-            # Keep the running total accurate.
+            # Keep the running cache size accurate.
             total -= size
         except OSError:
-            # Ignore chunks already removed by another operation.
+            # Ignore chunks already removed by another request.
             pass
+
+    # Re-check physical free space after cache eviction.
+    if disk is not None:
+        try:
+            disk = shutil.disk_usage(DATA_DIR)
+        except OSError:
+            disk = None
+
+    # Return the resulting cache size; callers can separately check free space.
+    return total
+
+
+def ensure_cache_space(required_bytes):
+    # Read the current filesystem state before starting a potentially large cache write.
+    try:
+        disk = shutil.disk_usage(DATA_DIR)
+    except OSError as exc:
+        raise OSError("Unable to read Railway volume free space") from exc
+
+    # Calculate the free-space reserve required after the new chunk is written.
+    needed_free = CACHE_MIN_FREE_BYTES + required_bytes
+    # Trigger cleanup when the cache approaches its configured high-water mark.
+    total, _ = cache_usage()
+    high_water = int(MAX_CACHE_TOTAL * CACHE_HIGH_WATERMARK)
+    if total >= high_water or disk.free < needed_free:
+        # Evict toward the lower target while preserving enough space for the new chunk.
+        evict_cache(required_free=required_bytes)
+
+    # Check the physical free space again after cleanup.
+    try:
+        disk = shutil.disk_usage(DATA_DIR)
+    except OSError as exc:
+        raise OSError("Unable to read Railway volume free space after cleanup") from exc
+
+    # If space is still insufficient, make one more aggressive cleanup pass.
+    if disk.free < needed_free:
+        evict_cache(target_total=0, required_free=required_bytes)
+        disk = shutil.disk_usage(DATA_DIR)
+
+    # Refuse the write before opening the temporary file if the volume is still full.
+    if disk.free < needed_free:
+        raise OSError(
+            "Railway volume is full even after cache cleanup: "
+            + str(disk.free)
+            + " bytes free, "
+            + str(needed_free)
+            + " bytes required"
+        )
 
 
 def clear_cache():
@@ -479,6 +557,13 @@ def download_chunk(file_id, index, file_size):
             response.close()
             raise HTTPException(status_code=502, detail="Unexpected Google Drive byte range")
 
+        # Make enough room before creating the temporary file, not after the disk is already full.
+        try:
+            ensure_cache_space(expected)
+        except OSError as exc:
+            response.close()
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
+
         # Write to a temporary file so an interrupted download cannot corrupt a valid chunk.
         temp = path.with_suffix(".tmp")
         written = 0
@@ -487,14 +572,29 @@ def download_chunk(file_id, index, file_size):
             with open(temp, "wb") as output:
                 for block in response.iter_content(chunk_size=1024 * 1024):
                     if block:
-                        output.write(block)
+                        try:
+                            # Write the current block to the temporary cache file.
+                            output.write(block)
+                        except OSError as exc:
+                            # Convert a full volume into a controlled HTTP error instead of crashing the stream.
+                            if getattr(exc, "errno", None) == 28:
+                                # Try to free space while preserving the current incomplete temp file.
+                                try:
+                                    output.flush()
+                                except OSError:
+                                    pass
+                                raise HTTPException(
+                                    status_code=507,
+                                    detail="Railway cache volume became full while downloading a video chunk",
+                                ) from exc
+                            raise
                         written += len(block)
             # Reject incomplete data before publishing the cache chunk.
             if written != expected:
                 raise HTTPException(status_code=502, detail="Incomplete chunk from Google Drive")
             # Atomically publish the complete chunk.
             os.replace(temp, path)
-            # Enforce the global cache size limit after the successful download.
+            # Perform a light LRU cleanup after a successful download.
             evict_cache()
             # Return the completed cache path.
             return path
