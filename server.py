@@ -33,8 +33,15 @@ LOCAL_SERVICE_ACCOUNT_FILE = Path(__file__).resolve().parent / "service-account.
 DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "1-l0SF3-SpaN3GopA5R2Aezqc17y539C9")
 # Cache each video in 8 MiB pieces to keep seeking reasonably responsive.
 CHUNK_SIZE = 8 * 1024 * 1024
-# Keep the persistent video cache capped at 2 GiB to avoid filling the Railway volume.
-MAX_CACHE_TOTAL = 2 * 1024 * 1024 * 1024
+# Keep the persistent video cache capped at 2 GiB by default.
+# The effective limit is also reduced automatically when the Railway Volume is smaller.
+MAX_CACHE_TOTAL = int(os.getenv("MAX_CACHE_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024)))
+# Keep at least this much physical disk space free for SQLite, temporary files and normal server operation.
+CACHE_MIN_FREE_BYTES = int(os.getenv("CACHE_MIN_FREE_BYTES", str(128 * 1024 * 1024)))
+# Start automatic cleanup when the effective cache limit is reached.
+CACHE_HIGH_WATERMARK = float(os.getenv("CACHE_HIGH_WATERMARK", "0.85"))
+# After cleanup, target this fraction of the effective cache limit.
+CACHE_TARGET_WATERMARK = float(os.getenv("CACHE_TARGET_WATERMARK", "0.65"))
 # Prefetch the next two pieces while the current piece is being watched.
 PREFETCH_CHUNKS = 2
 # Limit background prefetch concurrency so Google Drive is not unnecessarily hammered.
@@ -384,31 +391,53 @@ def chunk_path(file_id, index):
     return cache_dir(file_id) / ("chunk_%08d.bin" % index)
 
 
-def evict_cache():
-    # Collect all cached chunks and their access times.
+def cache_usage():
+    # Collect all complete video cache chunks and their access times.
     files = []
-    # Track total cache bytes.
+    # Track the total number of bytes currently occupied by video chunks.
     total = 0
-    # Walk every video cache directory.
+    # Walk every per-video cache directory.
     for path in CACHE_DIR.rglob("chunk_*.bin"):
         try:
-            # Read file metadata once.
+            # Read the chunk metadata once.
             stat = path.stat()
-            # Add this chunk to the total size.
+            # Add the chunk size to the cache total.
             total += stat.st_size
-            # Save access time, path and size for eviction sorting.
+            # Keep access time so the least-recently-used chunks can be removed first.
             files.append((stat.st_atime, path, stat.st_size))
         except OSError:
-            # Ignore chunks that disappear during the scan.
+            # Ignore files that disappear while another request is using the cache.
             pass
-    # Stop immediately when the cache is below the configured limit.
-    if total <= MAX_CACHE_TOTAL:
-        return
+    # Return both the total size and the list used for eviction.
+    return total, files
+
+
+def effective_cache_limit(required_bytes=0):
+    # Read the physical disk capacity and free space for the persistent data directory.
+    usage = shutil.disk_usage(DATA_DIR)
+    # Never allow the cache to consume the reserve needed for the application and a new chunk.
+    physical_limit = max(0, usage.total - CACHE_MIN_FREE_BYTES - required_bytes)
+    # The effective cache limit is the smaller of the configured limit and physical capacity.
+    return max(0, min(MAX_CACHE_TOTAL, physical_limit))
+
+
+def evict_cache(required_bytes=0, force=False):
+    # Read the current cache contents.
+    total, files = cache_usage()
+    # Calculate the maximum cache size that is safe for the current Railway Volume.
+    limit = effective_cache_limit(required_bytes)
+    # Calculate the high-water mark that triggers normal cleanup.
+    high_water = int(limit * CACHE_HIGH_WATERMARK)
+    # Skip cleanup when the cache is comfortably below its safe limit.
+    if not force and total <= high_water:
+        return total
+    # Remove more aggressively than the trigger point so cleanup does not happen on every chunk.
+    target = int(limit * CACHE_TARGET_WATERMARK)
     # Remove least-recently-used chunks first.
     files.sort(key=lambda item: item[0])
-    # Delete old chunks until the cache is back below its limit.
+    # Delete old chunks until the cache reaches the target.
     for _, path, size in files:
-        if total <= MAX_CACHE_TOTAL:
+        if total <= target:
             break
         try:
             # Remove the selected cached chunk.
@@ -416,8 +445,39 @@ def evict_cache():
             # Keep the running total accurate.
             total -= size
         except OSError:
-            # Ignore chunks already removed by another operation.
+            # Ignore chunks that were already removed by another cleanup operation.
             pass
+    # Remove orphan temporary files left by interrupted downloads.
+    for path in CACHE_DIR.rglob("*.tmp"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    # Return the remaining cache size for diagnostics.
+    return total
+
+
+def ensure_cache_space(required_bytes):
+    # Read current physical disk usage.
+    usage = shutil.disk_usage(DATA_DIR)
+    # Calculate how much free space must remain after writing the new chunk.
+    required_free = CACHE_MIN_FREE_BYTES + required_bytes
+    # Trigger cleanup when physical free space is already too low.
+    if usage.free < required_free:
+        evict_cache(required_bytes=required_bytes, force=True)
+        # Re-check the physical disk after cleanup.
+        usage = shutil.disk_usage(DATA_DIR)
+    # Also clean up when the effective cache limit has reached its high-water mark.
+    total, _ = cache_usage()
+    limit = effective_cache_limit(required_bytes)
+    if total + required_bytes > int(limit * CACHE_HIGH_WATERMARK):
+        evict_cache(required_bytes=required_bytes, force=True)
+        # Re-check both cache size and physical free space.
+        usage = shutil.disk_usage(DATA_DIR)
+        total, _ = cache_usage()
+    # If enough space is still unavailable, tell the caller to stream directly from Drive.
+    if usage.free < required_free:
+        raise OSError("Not enough Railway Volume space for cache chunk")
 
 
 def clear_cache():
@@ -499,6 +559,14 @@ def download_chunk(file_id, index, file_size):
             response.close()
             raise HTTPException(status_code=502, detail="Unexpected Google Drive byte range")
 
+        # Free enough physical space before creating the temporary chunk file.
+        try:
+            ensure_cache_space(expected)
+        except OSError:
+            # Close the Drive response before letting the caller fall back to direct streaming.
+            response.close()
+            raise
+
         # Write to a temporary file so an interrupted download cannot corrupt a valid chunk.
         temp = path.with_suffix(".tmp")
         written = 0
@@ -514,7 +582,7 @@ def download_chunk(file_id, index, file_size):
                 raise HTTPException(status_code=502, detail="Incomplete chunk from Google Drive")
             # Atomically publish the complete chunk.
             os.replace(temp, path)
-            # Enforce the global cache size limit after the successful download.
+            # Enforce the cache limit again after the successful download.
             evict_cache()
             # Return the completed cache path.
             return path
@@ -547,6 +615,31 @@ def prefetch(file_id, first_index, file_size):
             pass
 
 
+def stream_drive_range(file_id, start, end):
+    # Build the authenticated Google Drive media endpoint.
+    url = "https://www.googleapis.com/drive/v3/files/" + file_id
+    # Request only the remaining byte range directly from Google Drive.
+    response = get_session().get(
+        url,
+        params={"alt": "media"},
+        headers=drive_headers({"Range": "bytes=%d-%d" % (start, end)}),
+        stream=True,
+        timeout=(10, 120),
+    )
+    # Require a partial-content response so the browser receives exactly the requested bytes.
+    if response.status_code != 206:
+        response.close()
+        raise HTTPException(status_code=502, detail="Google Drive direct range request failed")
+    try:
+        # Stream Drive blocks directly without writing them to the Railway Volume.
+        for block in response.iter_content(chunk_size=1024 * 1024):
+            if block:
+                yield block
+    finally:
+        # Always close the Drive response after the stream finishes or the client disconnects.
+        response.close()
+
+
 def iter_range(file_id, start, end, file_size):
     # Identify the first cache chunk touched by the requested byte range.
     first = start // CHUNK_SIZE
@@ -554,8 +647,13 @@ def iter_range(file_id, start, end, file_size):
     last = end // CHUNK_SIZE
     # Stream each required cache chunk in order.
     for index in range(first, last + 1):
-        # Download the chunk on demand or reuse the existing cache file.
-        path = download_chunk(file_id, index, file_size)
+        try:
+            # Download the chunk on demand or reuse the existing cache file.
+            path = download_chunk(file_id, index, file_size)
+        except OSError:
+            # If the Volume cannot safely hold another chunk, bypass the cache for the rest of this request.
+            yield from stream_drive_range(file_id, max(start, index * CHUNK_SIZE), end)
+            return
         # Stop safely if no chunk exists beyond the file size.
         if path is None:
             return
@@ -569,25 +667,23 @@ def iter_range(file_id, start, end, file_size):
         with open(path, "rb") as source:
             # Seek directly to the requested byte inside the chunk.
             source.seek(offset)
-            # Calculate how many bytes remain to be streamed from this chunk.
+            # Stream only the requested portion of the chunk.
             remaining = limit - offset + 1
-            # Stream in 1 MiB blocks.
             while remaining > 0:
-                # Read no more than 1 MiB at a time.
+                # Read in moderate blocks to balance latency and memory use.
                 block = source.read(min(1024 * 1024, remaining))
                 # Stop if the cache file unexpectedly ends.
                 if not block:
-                    return
-                # Reduce the remaining byte count.
+                    break
+                # Decrease the number of bytes still needed.
                 remaining -= len(block)
-                try:
-                    # Refresh the access time for LRU eviction.
-                    os.utime(path, None)
-                except OSError:
-                    # Ignore access-time failures.
-                    pass
                 # Yield the block to FastAPI's streaming response.
                 yield block
+        # Update the chunk access time after successful playback.
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
 
 
 def parse_range(header, file_size):
